@@ -15,11 +15,17 @@ from autogluon.timeseries.utils.warning_filters import evaluator_warning_filter
 
 logger = logging.getLogger(__name__)
 
+def get_seasonal_diffs(*, y_past: pd.Series, seasonal_period: int = 1) -> pd.Series:
+    return y_past.groupby(level=ITEMID, sort=False).diff(seasonal_period).abs()
 
 def in_sample_seasonal_naive_error(*, y_past: pd.Series, seasonal_period: int = 1) -> pd.Series:
     """Compute seasonal naive forecast error (predict value from seasonal_period steps ago) for each time series."""
-    seasonal_diffs = y_past.groupby(level=ITEMID, sort=False).diff(seasonal_period).abs()
+    seasonal_diffs = get_seasonal_diffs(y_past, seasonal_period=seasonal_period)
     return seasonal_diffs.groupby(level=ITEMID, sort=False).mean().fillna(1.0)
+
+def in_sample_random_walk_error(*, y_past: pd.Series) -> pd.Series:
+    onestep_diffs = get_seasonal_diffs(y_past, seasonal_period=1)
+    return onestep_diffs.dropna().pow(2.0).groupby(level=ITEMID, sort=False).mean()
 
 
 def mse_per_item(*, y_true: pd.Series, y_pred: pd.Series) -> pd.Series:
@@ -35,6 +41,19 @@ def mae_per_item(*, y_true: pd.Series, y_pred: pd.Series) -> pd.Series:
 def mape_per_item(*, y_true: pd.Series, y_pred: pd.Series) -> pd.Series:
     """Compute Mean Absolute Percentage Error for each item (time series)."""
     return ((y_true - y_pred) / y_true).abs().groupby(level=ITEMID, sort=False).mean()
+
+
+def rmsse_per_item(*, y_true: pd.Series, y_pred: pd.Series) -> pd.Series:
+    mse = mse_per_item(y_true=y_true, y_pred=y_pred)
+    rw_in_sample = (
+        y_true.diff()
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .pow(2.0)
+        .groupby(level=ITEMID, sort=False)
+        .mean()
+    )
+    return np.sqrt(mse / rw_in_sample)
 
 
 def symmetric_mape_per_item(*, y_true: pd.Series, y_pred: pd.Series) -> pd.Series:
@@ -97,7 +116,7 @@ class TimeSeriesEvaluator:
         :meth:``~autogluon.timeseries.TimeSeriesEvaluator.check_get_evaluation_metric``.
     """
 
-    AVAILABLE_METRICS = ["MASE", "MAPE", "sMAPE", "mean_wQuantileLoss", "MSE", "RMSE", "WAPE"]
+    AVAILABLE_METRICS = ["MASE", "MAPE", "sMAPE", "mean_wQuantileLoss", "MSE", "RMSE", "WAPE", "RMSSE"]
     METRIC_COEFFICIENTS = {
         "MASE": -1,
         "MAPE": -1,
@@ -106,6 +125,7 @@ class TimeSeriesEvaluator:
         "MSE": -1,
         "RMSE": -1,
         "WAPE": -1,
+        "RMSSE": -1,
     }
     DEFAULT_METRIC = "mean_wQuantileLoss"
 
@@ -174,6 +194,14 @@ class TimeSeriesEvaluator:
         abs_target_sum = y_true.abs().sum()
         return abs_error_sum / abs_target_sum
 
+    def _rmsse(self, y_true: pd.Series, predictions: TimeSeriesDataFrame) -> float:
+        y_pred = self._get_median_forecast(predictions)
+        # rmsse = rmsse_per_item(y_true: pd.Series, y_pred: pd.Series)
+        # return rmsse.mean()
+        return 2
+
+
+
     def _get_median_forecast(self, predictions: TimeSeriesDataFrame) -> pd.Series:
         # TODO: Median forecast doesn't actually minimize the MAPE / sMAPE losses
         if "0.5" in predictions.columns:
@@ -218,6 +246,9 @@ class TimeSeriesEvaluator:
         self._past_naive_error = in_sample_seasonal_naive_error(
             y_past=data_past[self.target_column], seasonal_period=seasonal_period
         )
+        if self.eval_metric == 'RMSSE':
+            self._random_walk_error = in_sample_random_walk_error(y_past=data_past[self.target_column])
+
 
     def score_with_saved_past_metrics(
         self, data_future: TimeSeriesDataFrame, predictions: TimeSeriesDataFrame
